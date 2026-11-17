@@ -1,0 +1,22 @@
+[package]
+name = "apex-solver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "apex_solver"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "apex_cli"
+path = "src/main.rs"
+
+[features]
+default = []
+python = ["pyo3", "numpy"]
+
+[dependencies]
+rayon = "1.12"
+rand = "0.8"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
