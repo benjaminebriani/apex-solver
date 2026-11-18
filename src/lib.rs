@@ -6,7 +6,7 @@ pub mod tree;
 mod python_bindings {
     use crate::card::Card;
     use crate::tree::SubgameSolver;
-    use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+    use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
     use pyo3::prelude::*;
 
     #[pyclass]
@@ -102,7 +102,7 @@ mod python_bindings {
                     pyo3::exceptions::PyValueError::new_err("Hand blocked or not in range")
                 })?;
 
-            let strat = self.inner.nodes.hand_nodes[idx].get_average_strategy();
+            let strat = self.inner.nodes.first().unwrap().hand_nodes[idx].get_average_strategy();
             Ok(strat.into_pyarray_bound(py))
         }
     }
