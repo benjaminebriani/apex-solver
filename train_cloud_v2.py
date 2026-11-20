@@ -2,12 +2,34 @@ import os
 import time
 import random
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import apex_solver
+
+# Average the noisy final-iteration CFR estimates over this many iterations.
+CFV_AVG_LAST = 20
+
+DRIVE_DIR = Path("/content/drive/MyDrive/apex-solver")
+LOCAL_DIR = Path("checkpoints")
+
+
+def get_output_dir():
+    """Prefer a mounted Google Drive; fall back to a local checkpoints dir."""
+    if DRIVE_DIR.parent.is_dir():
+        try:
+            DRIVE_DIR.mkdir(parents=True, exist_ok=True)
+            probe = DRIVE_DIR / ".write_test"
+            probe.touch()
+            probe.unlink()
+            return DRIVE_DIR
+        except OSError as exc:
+            print(f"Drive not writable ({exc}); falling back to {LOCAL_DIR}/", flush=True)
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCAL_DIR
 
 
 def generate_realistic_range(board_set, tightness):
@@ -36,8 +58,8 @@ def generate_realistic_range(board_set, tightness):
     return rng
 
 
-def solve_single_subgame(seed_and_iters):
-    seed, iterations = seed_and_iters
+def solve_single_subgame(job):
+    seed, iterations, avg_last = job
     random.seed(seed)
     np.random.seed(seed)
 
@@ -65,7 +87,7 @@ def solve_single_subgame(seed_and_iters):
     solver = apex_solver.PySubgameSolver.from_arrays(
         board, oop_range, ip_range, pot, eff_stack, [0.5, 1.0]
     )
-    oop_cfvs, ip_cfvs = solver.solve(iterations)
+    oop_cfvs, ip_cfvs = solver.solve(iterations, avg_last)
 
     board_vec = np.zeros(52, dtype=np.float32)
     for c in board:
@@ -112,14 +134,17 @@ class TurnValueNetwork(nn.Module):
 
 
 def run_cloud_pipeline(num_samples=10000, iterations=120, epochs=40, batch_size=128):
-    os.makedirs("checkpoints", exist_ok=True)
+    out_dir = get_output_dir()
+    dataset_path = out_dir / "turn_dataset_v2.npz"
+    weights_path = out_dir / "turn_value_net_v2.pt"
     num_workers = max(1, os.cpu_count() or 4)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on {num_workers} CPU workers + GPU device: {device}", flush=True)
+    print(f"Saving checkpoints to {out_dir}", flush=True)
 
     t0 = time.time()
     X_list, Y_list = [], []
-    tasks = [(int(time.time() * 1000) + i, iterations) for i in range(num_samples)]
+    tasks = [(1000 + i, iterations, CFV_AVG_LAST) for i in range(num_samples)]
 
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         for i, (x, y) in enumerate(pool.map(solve_single_subgame, tasks, chunksize=8), 1):
@@ -130,7 +155,7 @@ def run_cloud_pipeline(num_samples=10000, iterations=120, epochs=40, batch_size=
                 rate = i / elapsed
                 print(f"[{i}/{num_samples}] solved ({rate:.1f} subgames/sec, {elapsed:.1f}s)", flush=True)
                 np.savez_compressed(
-                    "checkpoints/dataset_latest.npz",
+                    dataset_path,
                     X=np.array(X_list, dtype=np.float32),
                     Y=np.array(Y_list, dtype=np.float32),
                 )
@@ -165,9 +190,10 @@ def run_cloud_pipeline(num_samples=10000, iterations=120, epochs=40, batch_size=
         scheduler.step()
         if epoch % 5 == 0 or epoch == 1:
             print(f"Epoch {epoch:02d}/{epochs} | Loss: {total_loss / len(loader):.6f}", flush=True)
-            torch.save(model.state_dict(), "checkpoints/turn_value_net.pt")
+            torch.save(model.state_dict(), weights_path)
 
-    print("TRAINING COMPLETE! Saved checkpoints/turn_value_net.pt", flush=True)
+    torch.save(model.state_dict(), weights_path)
+    print(f"TRAINING COMPLETE! Saved {weights_path} and {dataset_path}", flush=True)
 
 
 if __name__ == "__main__":

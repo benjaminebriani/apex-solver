@@ -48,6 +48,11 @@ pub struct SubgameSolver {
     pub nodes: Vec<TreeNode>,
     pub river_scores: Vec<Option<Vec<u32>>>,
     pub river_sorted: Vec<Option<Vec<usize>>>,
+    /// Pot-normalized CFVs from the value net, in `generate_all_hands()` order:
+    /// (OOP, IP). Each is 1,326 floats.
+    pub leaf_cfvs: Option<(Vec<f32>, Vec<f32>)>,
+    /// Weight applied to the neural prior at Showdown leaves (0.0 = exact equity).
+    pub leaf_lambda: f32,
 }
 
 impl SubgameSolver {
@@ -154,6 +159,8 @@ impl SubgameSolver {
             nodes: Vec::new(),
             river_scores,
             river_sorted,
+            leaf_cfvs: None,
+            leaf_lambda: 0.0,
         };
 
         let init_stacks = [effective_stack, effective_stack];
@@ -195,10 +202,9 @@ impl SubgameSolver {
             let actual_call = to_call.min(my_stack);
             let mut call_stacks = stacks;
             call_stacks[player] -= actual_call;
-            let [cs_oop, cs_ip] = call_stacks;
 
             actions.push(Action::Call);
-            if street == Street::Turn && cs_oop > 0.01 && cs_ip > 0.01 {
+            if street == Street::Turn {
                 let river_root = self.build_tree(
                     Street::River,
                     0,
@@ -240,7 +246,7 @@ impl SubgameSolver {
             let [s_oop, s_ip] = stacks;
             actions.push(Action::Check);
             if facing_check {
-                if street == Street::Turn && s_oop > 0.01 && s_ip > 0.01 {
+                if street == Street::Turn {
                     let river_root = self.build_tree(
                         Street::River,
                         0,
@@ -326,14 +332,37 @@ impl SubgameSolver {
         idx
     }
 
+    /// Solves and returns the CFV estimate from the final CFR iteration.
     pub fn solve(&mut self, iterations: u32) -> (Vec<f32>, Vec<f32>) {
+        self.solve_with_averaging(iterations, 1)
+    }
+
+    /// Solves and averages each player's CFVs over the last `avg_last` iterations.
+    ///
+    /// Each player is averaged only over the iterations in the window where
+    /// that player was the traverser (i.e. over its own fresh CFR estimates),
+    /// so odd window sizes do not bias one side. `avg_last` is clamped to
+    /// `[1, iterations]`; when the window contains no update for a player, its
+    /// most recent estimate is returned, matching the single-iteration case.
+    pub fn solve_with_averaging(
+        &mut self,
+        iterations: u32,
+        avg_last: u32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let num_hands = self.valid_hands.len();
+        let avg_last = avg_last.max(1).min(iterations.max(1));
+        let window_start = iterations.saturating_sub(avg_last) + 1;
         let initial_river = if self.board.len() == 5 {
             self.board.first().unwrap().0 as usize
         } else {
             0
         };
-        let mut last_oop_cfvs = vec![0.0f32; self.valid_hands.len()];
-        let mut last_ip_cfvs = vec![0.0f32; self.valid_hands.len()];
+        let mut last_oop_cfvs = vec![0.0f32; num_hands];
+        let mut last_ip_cfvs = vec![0.0f32; num_hands];
+        let mut sum_oop = vec![0.0f32; num_hands];
+        let mut sum_ip = vec![0.0f32; num_hands];
+        let mut oop_updates = 0u32;
+        let mut ip_updates = 0u32;
 
         for iter in 1..=iterations {
             let traverser = (iter % 2) as usize;
@@ -354,13 +383,39 @@ impl SubgameSolver {
             } else {
                 last_ip_cfvs = cfvs;
             }
+
+            if iter >= window_start {
+                if traverser == 0 {
+                    for h in 0..num_hands {
+                        sum_oop[h] += last_oop_cfvs[h];
+                    }
+                    oop_updates += 1;
+                } else {
+                    for h in 0..num_hands {
+                        sum_ip[h] += last_ip_cfvs[h];
+                    }
+                    ip_updates += 1;
+                }
+            }
         }
 
+        let inv_oop = 1.0 / oop_updates.max(1) as f32;
+        let inv_ip = 1.0 / ip_updates.max(1) as f32;
         let mut full_oop_cfvs = vec![0.0f32; 1326];
         let mut full_ip_cfvs = vec![0.0f32; 1326];
         for (v_idx, &all_idx) in self.valid_to_all.iter().enumerate() {
-            full_oop_cfvs[all_idx] = last_oop_cfvs[v_idx];
-            full_ip_cfvs[all_idx] = last_ip_cfvs[v_idx];
+            let oop_val = if oop_updates > 0 {
+                sum_oop[v_idx] * inv_oop
+            } else {
+                last_oop_cfvs[v_idx]
+            };
+            let ip_val = if ip_updates > 0 {
+                sum_ip[v_idx] * inv_ip
+            } else {
+                last_ip_cfvs[v_idx]
+            };
+            full_oop_cfvs[all_idx] = oop_val;
+            full_ip_cfvs[all_idx] = ip_val;
         }
         (full_oop_cfvs, full_ip_cfvs)
     }
@@ -636,9 +691,54 @@ impl SubgameSolver {
                     }
                     idx = tie_end;
                 }
+
+                // Neural leaf evaluation: blend the exact showdown EV with the
+                // value net's pot-normalized CFV estimate for this traverser.
+                if let Some((oop_prior, ip_prior)) = &self.leaf_cfvs {
+                    let lambda = self.leaf_lambda.clamp(0.0, 1.0);
+                    if lambda > 0.0 {
+                        let prior = if traverser == 0 { oop_prior } else { ip_prior };
+                        for i in 0..num_hands {
+                            let exact_ev = evs[i];
+                            let prior_ev = pot * prior[self.valid_to_all[i]];
+                            evs[i] = (1.0 - lambda) * exact_ev + lambda * prior_ev;
+                        }
+                    }
+                }
             }
             _ => {}
         }
         evs
+    }
+
+    /// CFR regret-based exploitability bound per player, in chip units.
+    ///
+    /// Uses the standard `sum(reach * max(0, regret)) / iterations` bound at
+    /// each decision node. Regret discounting makes this an approximation, but
+    /// it is a useful relative measure when comparing leaf configurations.
+    #[allow(dead_code)]
+    pub fn get_exploitability_bound(&self, iterations: u32) -> (f32, f32) {
+        let num_hands = self.valid_hands.len();
+        let mut totals = [0.0f32; 2];
+        for node in &self.nodes {
+            if node.is_terminal || node.hand_nodes.len() != num_hands {
+                continue;
+            }
+            let p = node.player;
+            let reach = if p == 0 { &self.oop_range } else { &self.ip_range };
+            for h in 0..num_hands {
+                if reach[h] == 0.0 {
+                    continue;
+                }
+                let max_regret = node.hand_nodes[h]
+                    .regret_sum
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, |a, b| a.max(b));
+                totals[p] += reach[h] * max_regret.max(0.0);
+            }
+        }
+        let inv = 1.0 / iterations.max(1) as f32;
+        (totals[0] * inv, totals[1] * inv)
     }
 }
